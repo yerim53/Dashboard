@@ -424,37 +424,67 @@ with tab_explore:
             st.caption(AI_SOURCE)
 
 # ------------------------------------------------------------
-# 5. 실행 가능한 액션 카드 (기간 마지막 3개월, 집단 선택만 무시)
+# 5. 액션 카드 · 문제 → 개선 제안 → 측정 지표
 # ------------------------------------------------------------
 with tab_action:
-    st.caption("측정 KPI의 현재 값은 선택한 기간의 마지막 3개월 기준으로 계산합니다. 가입 채널·플랫폼 필터는 적용하지 않습니다.")
+    st.markdown("### 개선 우선순위 및 액션")
+    st.caption("6주차에서 관찰된 문제를 개선 가설로 연결하고, 측정 KPI를 확인합니다.")
     recent = [mo for mo in months if start <= mo <= end][-3:]
     f_recent = df[df["가입월"].isin(recent)]
     r_recent = rd[rd["가입월"].isin(recent)]
     focus_name = HIGHLIGHT if HIGHLIGHT in channels else (channels[0] if channels else None)
-    a, b = st.columns(2)
-    with a:
-        with st.container(border=True):
-            st.markdown("**액션 카드 ① · organic 장바구니 전환 개선**")
-            st.write("**문제:** 식당 조회 이후 장바구니 추가 단계에서 이탈 가능성")
-            st.write("**근거:** 6주차 세션 기준 조회 → 장바구니 전환율이 2025-12 53.6%에서 2026-04 43.8%로 하락. 현재 카드 값은 신규 가입자 기준으로 별도 집계")
-            st.write("**성격:** 전환 퍼널 개선 가설")
-            st.write("**액션:** 식당 상세·메뉴 탐색 및 장바구니 진입 단계의 사용자 행동을 추가 조사하고 개선안 A/B 테스트")
-            st.write("**우선순위:** 높음 (원인 검증 선행)")
-            seg = f_recent[f_recent["가입채널"] == focus_name] if focus_name else f_recent.iloc[:0]
-            k = pct(seg["장바구니"].sum(), seg["식당조회"].sum())
-            st.metric("측정 KPI · 조회 → 장바구니", fmt(k))
-            st.caption(f"대시보드에서: 개요 ② / 탐색 드릴다운 · {focus_name or '집단 없음'}")
-    with b:
-        with st.container(border=True):
-            st.markdown("**액션 카드 ② · organic 초기 재주문 개선**")
-            st.write("**문제:** 첫 주문 후 30일 내 재주문 유지 가능성")
-            st.write("**근거:** 6주차 세션 분석에서 organic 첫 주문 고객 30일 재주문율이 76.8% → 73.3%로 하락")
-            st.write("**성격:** 초기 리텐션 개선 가설")
-            st.write("**액션:** 첫 주문 이후 재방문 구간을 진단하고 재주문 유도 실험을 설계한 뒤 집단 간 KPI 비교")
-            st.write("**우선순위:** 중간 (전환 문제와 병행 검증)")
-            seg = r_recent[r_recent["가입채널"] == focus_name] if focus_name else r_recent.iloc[:0]
-            k = pct(seg["재주문30일"].sum(), seg["첫주문고객"].sum())
-            st.metric("측정 KPI · 첫 주문 후 30일 재주문", fmt(k))
-            st.caption(f"대시보드에서: 개요 ③ / 탐색 비교 · {focus_name or '집단 없음'}")
-    st.info("액션은 관찰 데이터에서 도출한 가설입니다. A/B 테스트나 추가 로그 검증 전에는 원인 및 개선 효과가 확정되지 않습니다.")
+    view_seg = f_recent[f_recent["가입채널"] == focus_name] if focus_name else f_recent.iloc[:0]
+    reorder_seg = r_recent[r_recent["가입채널"] == focus_name] if focus_name else r_recent.iloc[:0]
+
+    action_cards = [
+        {
+            "number": "01",
+            "title": "장바구니 전환 개선",
+            "priority": "우선순위 · 높음",
+            "category": "구매 전환 퍼널",
+            "issue": "식당을 조회한 뒤 장바구니에 담지 않고 이탈할 가능성",
+            "plan": "식당 상세·메뉴 탐색부터 장바구니 추가까지의 행동을 점검하고, 개선안의 A/B 테스트를 진행합니다.",
+            "metric": "조회 → 장바구니 전환율",
+            "value": fmt(pct(view_seg["장바구니"].sum(), view_seg["식당조회"].sum())),
+            "formula": "장바구니에 도달한 신규 가입자 ÷ 식당을 조회한 신규 가입자",
+            "reference": "개요 ② / 탐색 드릴다운",
+            "evidence": "6주차 세션 기준 전체 조회 → 장바구니 전환율은 2025-12 53.6%에서 2026-04 43.8%로 하락했습니다. 해당 추이와 지금의 가입자 기준 KPI는 서로 다른 지표입니다.",
+        },
+        {
+            "number": "02",
+            "title": "초기 재주문 개선",
+            "priority": "우선순위 · 중간",
+            "category": "고객 리텐션",
+            "issue": "첫 주문 이후 30일 안에 다시 주문하지 않는 고객 발생",
+            "plan": "첫 주문 후 재방문 구간을 분석하고, 재주문 유도 실험 후 집단별 KPI를 비교합니다.",
+            "metric": "첫 주문 후 30일 재주문율",
+            "value": fmt(pct(reorder_seg["재주문30일"].sum(), reorder_seg["첫주문고객"].sum())),
+            "formula": "첫 주문 후 30일 내 재주문한 고객 ÷ 첫 주문 고객",
+            "reference": "개요 ③ / 탐색 집단 비교",
+            "evidence": "6주차 분석에서 organic 유입 첫 주문 고객의 30일 재주문율은 76.8%에서 73.3%로 하락했습니다. 현 KPI는 신규 가입월·가입채널 기준 별도 집계입니다.",
+        },
+    ]
+
+    action_cols = st.columns(2, gap="medium")
+    for col, item in zip(action_cols, action_cards):
+        with col:
+            with st.container(border=True):
+                st.caption(f"ACTION {item['number']}  ·  {item['category']}")
+                st.subheader(item["title"])
+                st.markdown(f"**{item['priority']}**")
+                st.markdown("**문제 정의**")
+                st.write(item["issue"])
+                st.markdown("**개선 액션**")
+                st.write(item["plan"])
+                st.divider()
+                st.caption(f"측정 KPI · {item['metric']}")
+                st.metric("측정값", item["value"], label_visibility="collapsed")
+                st.caption(f"최근 3개월 · {focus_name or '해당 집단 없음'} · {item['reference']}")
+                with st.popover("ⓘ 근거 및 계산 기준"):
+                    st.markdown("**6주차 분석 근거**")
+                    st.write(item["evidence"])
+                    st.markdown("**현재 KPI 산식**")
+                    st.write(item["formula"])
+                    st.caption("기간은 사이드바에서 선택한 가입월의 마지막 3개월이며, 가입 채널·플랫폼 필터는 적용하지 않습니다.")
+    st.caption("※ 이 탭의 측정 KPI에는 기간 필터만 적용되며, 가입 채널·플랫폼 필터는 적용되지 않습니다.")
+    st.info("위 액션은 관찰 데이터에 기반한 개선 가설입니다. 추가 로그 분석과 A/B 테스트 전에는 원인이나 효과가 확정되지 않습니다.")
