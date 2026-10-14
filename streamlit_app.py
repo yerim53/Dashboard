@@ -9,6 +9,8 @@
   (===== 시작 줄과 ===== 끝 줄 사이를 지우고 받은 블록을 붙임, 첫 줄은 맨 앞에 빈칸 없이)
 """
 import sqlite3
+import io
+import hashlib
 
 import pandas as pd
 import plotly.express as px
@@ -22,6 +24,33 @@ st.caption("경기 남부 신규 권역 | 2025.09~2026.08 원본 이벤트 · �
 # 0. 필요한 데이터만 추출 — 쓸 테이블과 컬럼만 메모리 DB에 올리고, 정제 테이블을 처음 한 번만 만듦
 # ------------------------------------------------------------
 DATA_DIR = "data"                          # 원본 CSV를 넣어 둔 폴더
+# 업로드한 CSV는 세션에서만 사용하며 디스크에 저장하지 않습니다.
+REQUIRED_UPLOAD_COLUMNS = {"event_id", "event_datetime", "customer_id", "session_id", "event_name", "platform", "traffic_source"}
+uploaded_file = st.session_state.get("upload_file")
+upload_bytes = None
+source_label = "data 폴더 기본 파일"
+upload_error = None
+if uploaded_file is not None:
+    candidate_bytes = uploaded_file.getvalue()
+    try:
+        file_columns = set(pd.read_csv(io.BytesIO(candidate_bytes), nrows=0).columns)
+        missing_columns = sorted(REQUIRED_UPLOAD_COLUMNS - file_columns)
+        if missing_columns:
+            upload_error = "필수 컬럼 누락: " + ", ".join(missing_columns)
+        else:
+            upload_bytes = candidate_bytes
+            source_label = f"올린 파일 {uploaded_file.name}"
+    except Exception as exc:
+        upload_error = f"CSV 파일을 읽을 수 없습니다: {exc}"
+
+dataset_signature = hashlib.sha256(upload_bytes).hexdigest() if upload_bytes is not None else "default"
+if "reset" not in st.session_state:
+    st.session_state.reset = 0
+previous_signature = st.session_state.get("dataset_signature")
+if previous_signature is not None and previous_signature != dataset_signature:
+    st.session_state.reset += 1
+st.session_state.dataset_signature = dataset_signature
+
 NEEDED = {                                 # ✏️ 이번 대시보드에 필요한 테이블과 컬럼 (쿼리에 쓰는 것만)
     "app_events": ["event_datetime", "customer_id", "session_id", "event_name",
                    "platform", "traffic_source", "campaign_name"],
@@ -29,11 +58,18 @@ NEEDED = {                                 # ✏️ 이번 대시보드에 필�
 }
 
 @st.cache_resource
-def get_db():                              # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events·odr을 생성(처음 한 번)
+def get_db(upload_bytes):                              # 필요한 컬럼만 메모리 DB에 올리고, 정제 테이블 events·odr을 생성(처음 한 번)
     con = sqlite3.connect(":memory:", check_same_thread=False)
     for name, cols in NEEDED.items():
         # dtype=str: 고객 ID의 앞자리 0(0000002)이 숫자로 바뀌지 않게 글자로 읽음
-        pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols, dtype=str).to_sql(name, con, index=False)
+        if name == "app_events" and upload_bytes is not None:
+            uploaded_df = pd.read_csv(io.BytesIO(upload_bytes), dtype=str)
+            if "campaign_name" not in uploaded_df.columns:
+                uploaded_df["campaign_name"] = None
+            input_df = uploaded_df[cols]
+        else:
+            input_df = pd.read_csv(f"{DATA_DIR}/{name}.csv", usecols=cols, dtype=str)
+        input_df.to_sql(name, con, index=False)
     # ✏️ 5주차 제외 규칙: 테스트 계정(T로 시작) 제외 · 이벤트 100건 이상인 비정상 세션 제외
     con.execute("""
         CREATE TABLE events AS
@@ -53,8 +89,8 @@ def get_db():                              # 필요한 컬럼만 메모리 DB에
 # 1. 데이터 준비 — 정제된 테이블을 SQL로 집계 (비율이 아니라 분자 · 분모 건수만)
 # ------------------------------------------------------------
 @st.cache_data
-def query(sql):                            # SQL을 실행해 표로 돌려줌
-    return pd.read_sql(sql, get_db())
+def query(sql, upload_bytes):              # 파일별 캐시 구분
+    return pd.read_sql(sql, get_db(upload_bytes))
 
 # 고객별 가입일 · 가입 채널 · 플랫폼 (가입 이벤트 기준) - 두 쿼리 모두 사용
 SQL_SIGNUP = """
@@ -124,10 +160,10 @@ SELECT strftime('%Y-%m', su.가입일) AS 가입월,
 """
 
 @st.cache_data
-def load_data():
-    return query(SQL_SIGNUP_FUNNEL), query(SQL_REORDER)
+def load_data(upload_bytes):
+    return query(SQL_SIGNUP_FUNNEL, upload_bytes), query(SQL_REORDER, upload_bytes)
 
-df, rd = load_data()                       # df: 가입 후 30일 퍼널 / rd: 30일 재주문
+df, rd = load_data(upload_bytes)                       # df: 가입 후 30일 퍼널 / rd: 30일 재주문
 
 # 📌 AI 해설: 아래 AI_NOTES = {} 한 줄을 Gemini가 준 AI_NOTES = { … } 로 바꾸기
 AI_NOTES = {}
@@ -219,10 +255,16 @@ g = df[df["가입채널"].isin(selected_channels) & df["플랫폼"].isin(selecte
 f = g[g["가입월"].between(start, end)]
 rg = rd[rd["가입채널"].isin(selected_channels) & rd["플랫폼"].isin(selected_platforms)]
 rf = rg[rg["가입월"].between(start, end)]
-st.caption(f"🔎 현재 조건 · {start} ~ {end} | 가입 채널 {len(selected_channels)}/{len(channels)}개 | 플랫폼 {len(selected_platforms)}/{len(platforms)}개")
+def show_selection(selected, available):
+    return "전체" if len(selected) == len(available) else (", ".join(selected) if selected else "선택 없음")
+
+st.caption(f"🔎 보고 있는 조건: 데이터 ({source_label}) · 기간 ({start} ~ {end}) · "
+           f"플랫폼 ({show_selection(selected_platforms, platforms)}) · "
+           f"유입 경로 ({show_selection(selected_channels, channels)})")
+if upload_error:
+    st.error(upload_error + " · data 폴더 기본 파일로 분석합니다.")
 if f.empty:
-    st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 다시 선택해 주세요.")
-    st.stop()
+    st.warning("선택한 조건에 해당하는 데이터가 없습니다. 필터를 다시 선택해 주세요. 데이터 업로드 탭은 계속 사용할 수 있습니다.")
 
 # 해설은 실시간으로 계산한 기술통계이며 외부 AI API를 호출하지 않습니다.
 AI_SOURCE = "📌 원본 CSV 집계 기준 · 현재 선택한 조건 · 자동 생성된 기술통계 (원인 추정은 검증 필요)"
@@ -230,261 +272,270 @@ AI_SOURCE = "📌 원본 CSV 집계 기준 · 현재 선택한 조건 · 자동 
 # ------------------------------------------------------------
 # 3. 개요
 # ------------------------------------------------------------
-tab_overview, tab_explore, tab_action = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션"])
-with tab_overview:
-    st.caption("핵심 KPI → 월별 문제 추이 → 유입 집단 비교 → 재주문 순서로 확인합니다.")
-    total = f[["가입자", "식당조회", "장바구니", "결제시작", "첫주문30일"]].sum()
-    repeated = rf[["첫주문고객", "재주문30일"]].sum()
-    st.markdown("### 핵심 KPI")
-    kpi_cards = [
-        ("01", "첫 주문 전환율", "가입 후 30일", fmt(pct(total["첫주문30일"], total["가입자"])),
-         "첫 주문 고객 ÷ 가입자", "신규 가입자의 구매 전환"),
-        ("02", "장바구니 전환율", "식당 조회 → 장바구니", fmt(pct(total["장바구니"], total["식당조회"])),
-         "장바구니 이용자 ÷ 식당 조회자", "탐색에서 장바구니로 이어지는 비율"),
-        ("03", "30일 재주문율", "첫 주문 후 30일", fmt(pct(repeated["재주문30일"], repeated["첫주문고객"])),
-         "30일 내 재주문 고객 ÷ 첫 주문 고객", "첫 주문 이후의 고객 유지"),
-    ]
-    kpi_columns = st.columns(3, gap="medium")
-    for column, (number, title, period_label, value, formula, summary) in zip(kpi_columns, kpi_cards):
-        with column:
-            with st.container(border=True):
-                st.caption(f"KPI {number}  ·  {period_label}")
-                st.markdown(f"**{title}**")
-                st.metric(label="전환율", value=value, label_visibility="collapsed")
-                st.caption(summary)
-                with st.popover("ⓘ 계산 기준"):
-                    st.write(formula)
-                    st.caption("현재 사이드바에서 선택한 가입월·가입 채널·플랫폼 조건이 적용됩니다.")
-    st.caption("※ 위 KPI는 가입자 또는 첫 주문 고객의 30일 행동 기준이며, 6주차의 세션 기준 45.7%와 직접 비교하지 않습니다.")
+tab_overview, tab_explore, tab_action, tab_upload = st.tabs(["📊 개요", "🔍 탐색", "✅ 액션", "📤 데이터 업로드"])
 
-    with st.container(border=True):
-        st.markdown("**📏 지금 숫자 읽기**")
-        metric_defs = [
-            ("30일 첫 주문 전환율", "첫주문30일", "가입자"),
-            ("조회 → 장바구니 전환율", "장바구니", "식당조회"),
+if not f.empty:
+    with tab_overview:
+        st.caption("핵심 KPI → 월별 문제 추이 → 유입 집단 비교 → 재주문 순서로 확인합니다.")
+        total = f[["가입자", "식당조회", "장바구니", "결제시작", "첫주문30일"]].sum()
+        repeated = rf[["첫주문고객", "재주문30일"]].sum()
+        st.markdown("### 핵심 KPI")
+        kpi_cards = [
+            ("01", "첫 주문 전환율", "가입 후 30일", fmt(pct(total["첫주문30일"], total["가입자"])),
+             "첫 주문 고객 ÷ 가입자", "신규 가입자의 구매 전환"),
+            ("02", "장바구니 전환율", "식당 조회 → 장바구니", fmt(pct(total["장바구니"], total["식당조회"])),
+             "장바구니 이용자 ÷ 식당 조회자", "탐색에서 장바구니로 이어지는 비율"),
+            ("03", "30일 재주문율", "첫 주문 후 30일", fmt(pct(repeated["재주문30일"], repeated["첫주문고객"])),
+             "30일 내 재주문 고객 ÷ 첫 주문 고객", "첫 주문 이후의 고객 유지"),
         ]
-        selected_months = [mo for mo in months if start <= mo <= end]
-        baseline_months = [mo for mo in months if base_start <= mo <= base_end]
-        if len(selected_months) < 3:
-            st.info("비교하려면 선택 기간을 3개월 이상 골라 주세요.")
-        elif len(baseline_months) < 3:
-            st.info("평소 범위를 계산하려면 기준 기간을 3개월 이상 선택해 주세요.")
-        else:
-            tail = selected_months[-3:]
-            curr = f[f["가입월"].isin(tail)]
-            baseline = g[g["가입월"].isin(baseline_months)]
-            for label, num, den in metric_defs:
-                c = pct(curr[num].sum(), curr[den].sum())
-                b = series_rate(baseline, ["가입월"], num, den)["율"].dropna()
-                if c is None or b.empty:
-                    st.write(f"- **{label}:** 비교할 데이터가 부족합니다.")
-                    continue
-                lo, hi = float(b.min()), float(b.max())
-                if c < lo:
-                    assessment = f"평소 하한보다 **{lo-c:.1f}%p 낮습니다**"
-                elif c > hi:
-                    assessment = f"평소 상한보다 **{c-hi:.1f}%p 높습니다**"
-                else:
-                    assessment = "평소 범위 안입니다"
-                st.markdown(f"- {tail[0]} 가입월부터 3개월 **{label} {c:.1f}%**, 평소 범위({lo:.1f}–{hi:.1f}%) 대비 {assessment}.")
-            st.caption(f"📏 자동 계산 · 평소 범위 기준: {base_start} ~ {base_end} (월별 분자 합계 ÷ 분모 합계)")
-        with st.expander("🤖 AI 해설 · 전체"):
-            st.write("전환율 변화는 데이터에서 관찰한 결과입니다. 광고 소재, UI 변경, 쿠폰 정책 등의 효과는 현재 CSV만으로 확인할 수 없어 원인으로 단정하지 않습니다.")
-            st.caption(AI_SOURCE)
+        kpi_columns = st.columns(3, gap="medium")
+        for column, (number, title, period_label, value, formula, summary) in zip(kpi_columns, kpi_cards):
+            with column:
+                with st.container(border=True):
+                    st.caption(f"KPI {number}  ·  {period_label}")
+                    st.markdown(f"**{title}**")
+                    st.metric(label="전환율", value=value, label_visibility="collapsed")
+                    st.caption(summary)
+                    with st.popover("ⓘ 계산 기준"):
+                        st.write(formula)
+                        st.caption("현재 사이드바에서 선택한 가입월·가입 채널·플랫폼 조건이 적용됩니다.")
+        st.caption("※ 위 KPI는 가입자 또는 첫 주문 고객의 30일 행동 기준이며, 6주차의 세션 기준 45.7%와 직접 비교하지 않습니다.")
 
-    with st.container(border=True):
-        st.markdown("**① 문제 · 가입월별 30일 첫 주문 전환율**")
-        m = series_rate(f, ["가입월"], "첫주문30일", "가입자")
-        fig = px.line(m, x="가입월", y="율", markers=True, custom_data=["가입자"],
-            labels={"가입월":"가입월", "율":"첫 주문 전환율(%)"})
-        fig.update_traces(line=dict(color=NAVY, width=3), marker=dict(size=8),
-            hovertemplate="%{x}<br>전환율 %{y:.1f}%<br>가입자 %{customdata[0]:,}명<extra></extra>")
-        fig.update_xaxes(type="category")
-        st.plotly_chart(style(fig, legend=False), use_container_width=True)
+        with st.container(border=True):
+            st.markdown("**📏 지금 숫자 읽기**")
+            metric_defs = [
+                ("30일 첫 주문 전환율", "첫주문30일", "가입자"),
+                ("조회 → 장바구니 전환율", "장바구니", "식당조회"),
+            ]
+            selected_months = [mo for mo in months if start <= mo <= end]
+            baseline_months = [mo for mo in months if base_start <= mo <= base_end]
+            if len(selected_months) < 3:
+                st.info("비교하려면 선택 기간을 3개월 이상 골라 주세요.")
+            elif len(baseline_months) < 3:
+                st.info("평소 범위를 계산하려면 기준 기간을 3개월 이상 선택해 주세요.")
+            else:
+                tail = selected_months[-3:]
+                curr = f[f["가입월"].isin(tail)]
+                baseline = g[g["가입월"].isin(baseline_months)]
+                for label, num, den in metric_defs:
+                    c = pct(curr[num].sum(), curr[den].sum())
+                    b = series_rate(baseline, ["가입월"], num, den)["율"].dropna()
+                    if c is None or b.empty:
+                        st.write(f"- **{label}:** 비교할 데이터가 부족합니다.")
+                        continue
+                    lo, hi = float(b.min()), float(b.max())
+                    if c < lo:
+                        assessment = f"평소 하한보다 **{lo-c:.1f}%p 낮습니다**"
+                    elif c > hi:
+                        assessment = f"평소 상한보다 **{c-hi:.1f}%p 높습니다**"
+                    else:
+                        assessment = "평소 범위 안입니다"
+                    st.markdown(f"- {tail[0]} 가입월부터 3개월 **{label} {c:.1f}%**, 평소 범위({lo:.1f}–{hi:.1f}%) 대비 {assessment}.")
+                st.caption(f"📏 자동 계산 · 평소 범위 기준: {base_start} ~ {base_end} (월별 분자 합계 ÷ 분모 합계)")
+            with st.expander("🤖 AI 해설 · 전체"):
+                st.write("전환율 변화는 데이터에서 관찰한 결과입니다. 광고 소재, UI 변경, 쿠폰 정책 등의 효과는 현재 CSV만으로 확인할 수 없어 원인으로 단정하지 않습니다.")
+                st.caption(AI_SOURCE)
 
-    left, right = st.columns(2)
-    with left:
         with st.container(border=True):
-            st.markdown("**② 원인 탐색 · 가입 채널별 장바구니 전환율**")
-            ch = series_rate(f, ["가입채널"], "장바구니", "식당조회").dropna(subset=["율"])
-            ch = ch.sort_values("율")
-            fig = go.Figure(go.Bar(x=ch["율"], y=ch["가입채널"], orientation="h",
-                marker_color=[NAVY if x == HIGHLIGHT else GRAY for x in ch["가입채널"]],
-                text=[f"{x:.1f}%" for x in ch["율"]], textposition="outside",
-                customdata=ch[["식당조회"]].to_numpy(),
-                hovertemplate="%{y}<br>전환율 %{x:.1f}%<br>식당 조회 %{customdata[0]:,}명<extra></extra>"))
-            fig.update_xaxes(visible=False, range=[0, max(100, ch["율"].max()*1.18) if not ch.empty else 100])
-            st.plotly_chart(style(fig, height=345, legend=False), use_container_width=True)
-    with right:
-        with st.container(border=True):
-            st.markdown("**③ 제안 근거 · 가입 채널별 30일 재주문율**")
-            rc = series_rate(rf, ["가입채널"], "재주문30일", "첫주문고객").dropna(subset=["율"])
-            rc = rc.sort_values("율")
-            fig = go.Figure(go.Bar(x=rc["율"], y=rc["가입채널"], orientation="h",
-                marker_color=[NAVY if x == HIGHLIGHT else GRAY for x in rc["가입채널"]],
-                text=[f"{x:.1f}%" for x in rc["율"]], textposition="outside",
-                customdata=rc[["첫주문고객"]].to_numpy(),
-                hovertemplate="%{y}<br>재주문율 %{x:.1f}%<br>첫 주문 고객 %{customdata[0]:,}명<extra></extra>"))
-            fig.update_xaxes(visible=False, range=[0, max(100, rc["율"].max()*1.18) if not rc.empty else 100])
-            st.plotly_chart(style(fig, height=345, legend=False), use_container_width=True)
-
-    with st.expander("📥 집계 데이터 내려받기"):
-        st.download_button("퍼널 집계 CSV", df.to_csv(index=False).encode("utf-8-sig"), "가입월_채널_플랫폼_퍼널.csv", mime="text/csv")
-        st.download_button("재주문 집계 CSV", rd.to_csv(index=False).encode("utf-8-sig"), "가입월_채널_플랫폼_재주문.csv", mime="text/csv")
-
-# ------------------------------------------------------------
-# 4. 탐색: 비교 집단, 단계 전환율, 월별 드릴다운
-# ------------------------------------------------------------
-with tab_explore:
-    st.caption("필터 조건 아래 집단을 비교하고, 전환율이 달라진 월을 드릴다운합니다.")
-    basis = st.radio("집단 비교 기준", ["가입채널", "플랫폼"], horizontal=True,
-        format_func=lambda x: "가입 채널" if x == "가입채널" else "플랫폼")
-    dims = ["가입자", "식당조회", "장바구니", "결제시작", "첫주문30일"]
-    stage_names = ["가입", "식당 조회", "장바구니", "결제 시작", "첫 주문 30일"]
-    group = f.groupby(basis)[dims].sum().reset_index()
-    small_names = group.loc[group["가입자"] < SMALL, basis].astype(str).tolist()
-    if hide_small:
-        group = group[group["가입자"] >= SMALL]
-        if small_names:
-            st.caption(f"제외한 집단: {', '.join(small_names)} (가입자 {SMALL}명 미만)")
-    elif small_names:
-        st.caption(f"⚠ 가입자 {SMALL}명 미만인 {', '.join(small_names)}의 지표는 크게 흔들릴 수 있습니다.")
-    if group.empty:
-        st.warning("표시할 집단이 없습니다. 고급 설정의 작은 집단 제외 옵션을 해제해 주세요.")
-    else:
-        cumulative = []
-        consecutive = []
-        for _, r in group.iterrows():
-            name = r[basis]
-            for i, (stage, num) in enumerate(zip(stage_names, dims)):
-                cumulative.append({"집단":name, "단계":stage, "전환율":pct(r[num], r["가입자"]), "단계순서":i})
-                if i > 0:
-                    consecutive.append({"집단":name, "단계":stage, "전환율":pct(r[num], r[dims[i-1]]),
-                                        "직전 단계 사람 수":int(r[dims[i-1]])})
-        cum = pd.DataFrame(cumulative)
-        cons = pd.DataFrame(consecutive)
-        palette = {name: (NAVY if name in (HIGHLIGHT, "Android") else [GRAY, GRAY_LIGHT, NAVY_LIGHT][i%3])
-                   for i,name in enumerate(group[basis].tolist())}
-        with st.container(border=True):
-            st.markdown("**집단 비교 · 누적 전환율과 단계별 전환율**")
-            left, right = st.columns(2)
-            with left:
-                fig = px.funnel(cum, x="전환율", y="단계", color="집단", color_discrete_map=palette,
-                    category_orders={"단계":stage_names}, title="가입자 대비 누적 전환율 (%)")
-                fig.update_traces(hovertemplate="%{fullData.name}<br>%{y} %{x:.1f}%<extra></extra>")
-                st.plotly_chart(style(fig, height=420), use_container_width=True)
-            with right:
-                fig = px.bar(cons.dropna(subset=["전환율"]), x="단계", y="전환율", color="집단", barmode="group",
-                    color_discrete_map=palette, text="전환율", custom_data=["직전 단계 사람 수"],
-                    category_orders={"단계":stage_names[1:]}, title="직전 단계 대비 전환율 (%)")
-                fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside",
-                    hovertemplate="%{fullData.name}<br>%{x}: %{y:.1f}%<br>직전 단계 %{customdata[0]:,}명<extra></extra>")
-                fig.update_layout(uniformtext_minsize=9, uniformtext_mode="hide")
-                st.plotly_chart(style(fig, height=420), use_container_width=True)
-        st.subheader("드릴다운 · 언제부터, 무엇 때문일까")
-        a,b = st.columns(2)
-        focus = a.selectbox("자세히 볼 집단", group[basis].astype(str).tolist())
-        steps = {
-            "가입 → 30일 첫 주문": ("첫주문30일", "가입자"),
-            "가입 → 식당조회": ("식당조회", "가입자"),
-            "식당조회 → 장바구니": ("장바구니", "식당조회"),
-            "장바구니 → 결제시작": ("결제시작", "장바구니"),
-            "결제시작 → 30일 첫 주문": ("첫주문30일", "결제시작"),
-        }
-        selection = b.selectbox("전환 단계", list(steps))
-        num, den = steps[selection]
-        other = "플랫폼" if basis == "가입채널" else "가입채널"
-        subset = f[f[basis].astype(str) == focus]
-        line = series_rate(subset, ["가입월",other], num, den)
-        with st.container(border=True):
-            st.markdown(f"**① {focus} · 가입월별 {selection} 전환율 ({other}별)**")
-            fig = px.line(line, x="가입월", y="율", color=other, markers=True,
-                color_discrete_sequence=[NAVY, GRAY, NAVY_LIGHT, GRAY_LIGHT],
-                labels={"가입월":"가입월", "율":"단계 전환율(%)"})
+            st.markdown("**① 문제 · 가입월별 30일 첫 주문 전환율**")
+            m = series_rate(f, ["가입월"], "첫주문30일", "가입자")
+            fig = px.line(m, x="가입월", y="율", markers=True, custom_data=["가입자"],
+                labels={"가입월":"가입월", "율":"첫 주문 전환율(%)"})
+            fig.update_traces(line=dict(color=NAVY, width=3), marker=dict(size=8),
+                hovertemplate="%{x}<br>전환율 %{y:.1f}%<br>가입자 %{customdata[0]:,}명<extra></extra>")
             fig.update_xaxes(type="category")
-            st.plotly_chart(style(fig), use_container_width=True)
-            st.caption("모든 갈래가 함께 움직였다면, 해당 구분 축만으로 원인을 설명하기는 어렵습니다.")
-        month_sizes = f.groupby(["가입월",basis])["가입자"].sum().reset_index()
-        target = month_sizes[month_sizes[basis].astype(str)==focus].set_index("가입월")["가입자"]
-        tot = f.groupby("가입월")["가입자"].sum()
-        composition = pd.DataFrame({"가입월":tot.index, "해당 집단":target.reindex(tot.index,fill_value=0).values})
-        composition["그 외"] = tot.values - composition["해당 집단"]
-        with st.container(border=True):
-            st.markdown("**② 가입월별 구성비 변화 · 선택 집단과 그 외**")
-            fig = go.Figure()
-            fig.add_bar(name="해당 집단", x=composition["가입월"], y=composition["해당 집단"], marker_color=NAVY)
-            fig.add_bar(name="그 외", x=composition["가입월"], y=composition["그 외"], marker_color=GRAY_LIGHT)
-            fig.update_layout(barmode="stack", yaxis_title="가입자(명)")
-            st.plotly_chart(style(fig), use_container_width=True)
-            st.caption("전체 전환율과 집단 비중이 동시에 변하더라도 인과관계가 확정되는 것은 아닙니다.")
-        with st.expander(f"🤖 AI 해설 · {focus}"):
-            focus_sum = subset[dims].sum()
-            st.write(f"{focus} 집단의 선택 기간 가입자 수는 {int(focus_sum['가입자']):,}명, 30일 첫 주문 전환율은 {fmt(pct(focus_sum['첫주문30일'],focus_sum['가입자']))}, 조회 → 장바구니 전환율은 {fmt(pct(focus_sum['장바구니'],focus_sum['식당조회']))}입니다.")
-            st.write("월별 변화와 채널/플랫폼의 구성 변화를 우선 확인할 필요가 있습니다. 현재 데이터만으로 광고, UI, 쿠폰 등의 원인을 단정할 수 없습니다.")
-            st.caption(AI_SOURCE)
+            st.plotly_chart(style(fig, legend=False), use_container_width=True)
 
-# ------------------------------------------------------------
-# 5. 액션 카드 · 문제 → 개선 제안 → 측정 지표
-# ------------------------------------------------------------
-with tab_action:
-    st.markdown("### 개선 우선순위 및 액션")
-    st.caption("6주차에서 관찰된 문제를 개선 가설로 연결하고, 측정 KPI를 확인합니다.")
-    recent = [mo for mo in months if start <= mo <= end][-3:]
-    f_recent = df[df["가입월"].isin(recent)]
-    r_recent = rd[rd["가입월"].isin(recent)]
-    focus_name = HIGHLIGHT if HIGHLIGHT in channels else (channels[0] if channels else None)
-    view_seg = f_recent[f_recent["가입채널"] == focus_name] if focus_name else f_recent.iloc[:0]
-    reorder_seg = r_recent[r_recent["가입채널"] == focus_name] if focus_name else r_recent.iloc[:0]
-
-    action_cards = [
-        {
-            "number": "01",
-            "title": "장바구니 전환 개선",
-            "priority": "우선순위 · 높음",
-            "category": "구매 전환 퍼널",
-            "issue": "식당을 조회한 뒤 장바구니에 담지 않고 이탈할 가능성",
-            "plan": "식당 상세·메뉴 탐색부터 장바구니 추가까지의 행동을 점검하고, 개선안의 A/B 테스트를 진행합니다.",
-            "metric": "조회 → 장바구니 전환율",
-            "value": fmt(pct(view_seg["장바구니"].sum(), view_seg["식당조회"].sum())),
-            "formula": "장바구니에 도달한 신규 가입자 ÷ 식당을 조회한 신규 가입자",
-            "reference": "개요 ② / 탐색 드릴다운",
-            "evidence": "6주차 세션 기준 전체 조회 → 장바구니 전환율은 2025-12 53.6%에서 2026-04 43.8%로 하락했습니다. 해당 추이와 지금의 가입자 기준 KPI는 서로 다른 지표입니다.",
-        },
-        {
-            "number": "02",
-            "title": "초기 재주문 개선",
-            "priority": "우선순위 · 중간",
-            "category": "고객 리텐션",
-            "issue": "첫 주문 이후 30일 안에 다시 주문하지 않는 고객 발생",
-            "plan": "첫 주문 후 재방문 구간을 분석하고, 재주문 유도 실험 후 집단별 KPI를 비교합니다.",
-            "metric": "첫 주문 후 30일 재주문율",
-            "value": fmt(pct(reorder_seg["재주문30일"].sum(), reorder_seg["첫주문고객"].sum())),
-            "formula": "첫 주문 후 30일 내 재주문한 고객 ÷ 첫 주문 고객",
-            "reference": "개요 ③ / 탐색 집단 비교",
-            "evidence": "6주차 분석에서 organic 유입 첫 주문 고객의 30일 재주문율은 76.8%에서 73.3%로 하락했습니다. 현 KPI는 신규 가입월·가입채널 기준 별도 집계입니다.",
-        },
-    ]
-
-    action_cols = st.columns(2, gap="medium")
-    for col, item in zip(action_cols, action_cards):
-        with col:
+        left, right = st.columns(2)
+        with left:
             with st.container(border=True):
-                st.caption(f"ACTION {item['number']}  ·  {item['category']}")
-                st.subheader(item["title"])
-                st.markdown(f"**{item['priority']}**")
-                st.markdown("**문제 정의**")
-                st.write(item["issue"])
-                st.markdown("**개선 액션**")
-                st.write(item["plan"])
-                st.divider()
-                st.caption(f"측정 KPI · {item['metric']}")
-                st.metric("측정값", item["value"], label_visibility="collapsed")
-                st.caption(f"최근 3개월 · {focus_name or '해당 집단 없음'} · {item['reference']}")
-                with st.popover("ⓘ 근거 및 계산 기준"):
-                    st.markdown("**6주차 분석 근거**")
-                    st.write(item["evidence"])
-                    st.markdown("**현재 KPI 산식**")
-                    st.write(item["formula"])
-                    st.caption("기간은 사이드바에서 선택한 가입월의 마지막 3개월이며, 가입 채널·플랫폼 필터는 적용하지 않습니다.")
-    st.caption("※ 이 탭의 측정 KPI에는 기간 필터만 적용되며, 가입 채널·플랫폼 필터는 적용되지 않습니다.")
-    st.info("위 액션은 관찰 데이터에 기반한 개선 가설입니다. 추가 로그 분석과 A/B 테스트 전에는 원인이나 효과가 확정되지 않습니다.")
+                st.markdown("**② 원인 탐색 · 가입 채널별 장바구니 전환율**")
+                ch = series_rate(f, ["가입채널"], "장바구니", "식당조회").dropna(subset=["율"])
+                ch = ch.sort_values("율")
+                fig = go.Figure(go.Bar(x=ch["율"], y=ch["가입채널"], orientation="h",
+                    marker_color=[NAVY if x == HIGHLIGHT else GRAY for x in ch["가입채널"]],
+                    text=[f"{x:.1f}%" for x in ch["율"]], textposition="outside",
+                    customdata=ch[["식당조회"]].to_numpy(),
+                    hovertemplate="%{y}<br>전환율 %{x:.1f}%<br>식당 조회 %{customdata[0]:,}명<extra></extra>"))
+                fig.update_xaxes(visible=False, range=[0, max(100, ch["율"].max()*1.18) if not ch.empty else 100])
+                st.plotly_chart(style(fig, height=345, legend=False), use_container_width=True)
+        with right:
+            with st.container(border=True):
+                st.markdown("**③ 제안 근거 · 가입 채널별 30일 재주문율**")
+                rc = series_rate(rf, ["가입채널"], "재주문30일", "첫주문고객").dropna(subset=["율"])
+                rc = rc.sort_values("율")
+                fig = go.Figure(go.Bar(x=rc["율"], y=rc["가입채널"], orientation="h",
+                    marker_color=[NAVY if x == HIGHLIGHT else GRAY for x in rc["가입채널"]],
+                    text=[f"{x:.1f}%" for x in rc["율"]], textposition="outside",
+                    customdata=rc[["첫주문고객"]].to_numpy(),
+                    hovertemplate="%{y}<br>재주문율 %{x:.1f}%<br>첫 주문 고객 %{customdata[0]:,}명<extra></extra>"))
+                fig.update_xaxes(visible=False, range=[0, max(100, rc["율"].max()*1.18) if not rc.empty else 100])
+                st.plotly_chart(style(fig, height=345, legend=False), use_container_width=True)
+
+        with st.expander("📥 집계 데이터 내려받기"):
+            st.download_button("퍼널 집계 CSV", df.to_csv(index=False).encode("utf-8-sig"), "가입월_채널_플랫폼_퍼널.csv", mime="text/csv")
+            st.download_button("재주문 집계 CSV", rd.to_csv(index=False).encode("utf-8-sig"), "가입월_채널_플랫폼_재주문.csv", mime="text/csv")
+
+    # ------------------------------------------------------------
+    # 4. 탐색: 비교 집단, 단계 전환율, 월별 드릴다운
+    # ------------------------------------------------------------
+    with tab_explore:
+        st.caption("필터 조건 아래 집단을 비교하고, 전환율이 달라진 월을 드릴다운합니다.")
+        basis = st.radio("집단 비교 기준", ["가입채널", "플랫폼"], horizontal=True,
+            format_func=lambda x: "가입 채널" if x == "가입채널" else "플랫폼")
+        dims = ["가입자", "식당조회", "장바구니", "결제시작", "첫주문30일"]
+        stage_names = ["가입", "식당 조회", "장바구니", "결제 시작", "첫 주문 30일"]
+        group = f.groupby(basis)[dims].sum().reset_index()
+        small_names = group.loc[group["가입자"] < SMALL, basis].astype(str).tolist()
+        if hide_small:
+            group = group[group["가입자"] >= SMALL]
+            if small_names:
+                st.caption(f"제외한 집단: {', '.join(small_names)} (가입자 {SMALL}명 미만)")
+        elif small_names:
+            st.caption(f"⚠ 가입자 {SMALL}명 미만인 {', '.join(small_names)}의 지표는 크게 흔들릴 수 있습니다.")
+        if group.empty:
+            st.warning("표시할 집단이 없습니다. 고급 설정의 작은 집단 제외 옵션을 해제해 주세요.")
+        else:
+            cumulative = []
+            consecutive = []
+            for _, r in group.iterrows():
+                name = r[basis]
+                for i, (stage, num) in enumerate(zip(stage_names, dims)):
+                    cumulative.append({"집단":name, "단계":stage, "전환율":pct(r[num], r["가입자"]), "단계순서":i})
+                    if i > 0:
+                        consecutive.append({"집단":name, "단계":stage, "전환율":pct(r[num], r[dims[i-1]]),
+                                            "직전 단계 사람 수":int(r[dims[i-1]])})
+            cum = pd.DataFrame(cumulative)
+            cons = pd.DataFrame(consecutive)
+            palette = {name: (NAVY if name in (HIGHLIGHT, "Android") else [GRAY, GRAY_LIGHT, NAVY_LIGHT][i%3])
+                       for i,name in enumerate(group[basis].tolist())}
+            with st.container(border=True):
+                st.markdown("**집단 비교 · 누적 전환율과 단계별 전환율**")
+                left, right = st.columns(2)
+                with left:
+                    fig = px.funnel(cum, x="전환율", y="단계", color="집단", color_discrete_map=palette,
+                        category_orders={"단계":stage_names}, title="가입자 대비 누적 전환율 (%)")
+                    fig.update_traces(hovertemplate="%{fullData.name}<br>%{y} %{x:.1f}%<extra></extra>")
+                    st.plotly_chart(style(fig, height=420), use_container_width=True)
+                with right:
+                    fig = px.bar(cons.dropna(subset=["전환율"]), x="단계", y="전환율", color="집단", barmode="group",
+                        color_discrete_map=palette, text="전환율", custom_data=["직전 단계 사람 수"],
+                        category_orders={"단계":stage_names[1:]}, title="직전 단계 대비 전환율 (%)")
+                    fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside",
+                        hovertemplate="%{fullData.name}<br>%{x}: %{y:.1f}%<br>직전 단계 %{customdata[0]:,}명<extra></extra>")
+                    fig.update_layout(uniformtext_minsize=9, uniformtext_mode="hide")
+                    st.plotly_chart(style(fig, height=420), use_container_width=True)
+            st.subheader("드릴다운 · 언제부터, 무엇 때문일까")
+            a,b = st.columns(2)
+            focus = a.selectbox("자세히 볼 집단", group[basis].astype(str).tolist())
+            steps = {
+                "가입 → 30일 첫 주문": ("첫주문30일", "가입자"),
+                "가입 → 식당조회": ("식당조회", "가입자"),
+                "식당조회 → 장바구니": ("장바구니", "식당조회"),
+                "장바구니 → 결제시작": ("결제시작", "장바구니"),
+                "결제시작 → 30일 첫 주문": ("첫주문30일", "결제시작"),
+            }
+            selection = b.selectbox("전환 단계", list(steps))
+            num, den = steps[selection]
+            other = "플랫폼" if basis == "가입채널" else "가입채널"
+            subset = f[f[basis].astype(str) == focus]
+            line = series_rate(subset, ["가입월",other], num, den)
+            with st.container(border=True):
+                st.markdown(f"**① {focus} · 가입월별 {selection} 전환율 ({other}별)**")
+                fig = px.line(line, x="가입월", y="율", color=other, markers=True,
+                    color_discrete_sequence=[NAVY, GRAY, NAVY_LIGHT, GRAY_LIGHT],
+                    labels={"가입월":"가입월", "율":"단계 전환율(%)"})
+                fig.update_xaxes(type="category")
+                st.plotly_chart(style(fig), use_container_width=True)
+                st.caption("모든 갈래가 함께 움직였다면, 해당 구분 축만으로 원인을 설명하기는 어렵습니다.")
+            month_sizes = f.groupby(["가입월",basis])["가입자"].sum().reset_index()
+            target = month_sizes[month_sizes[basis].astype(str)==focus].set_index("가입월")["가입자"]
+            tot = f.groupby("가입월")["가입자"].sum()
+            composition = pd.DataFrame({"가입월":tot.index, "해당 집단":target.reindex(tot.index,fill_value=0).values})
+            composition["그 외"] = tot.values - composition["해당 집단"]
+            with st.container(border=True):
+                st.markdown("**② 가입월별 구성비 변화 · 선택 집단과 그 외**")
+                fig = go.Figure()
+                fig.add_bar(name="해당 집단", x=composition["가입월"], y=composition["해당 집단"], marker_color=NAVY)
+                fig.add_bar(name="그 외", x=composition["가입월"], y=composition["그 외"], marker_color=GRAY_LIGHT)
+                fig.update_layout(barmode="stack", yaxis_title="가입자(명)")
+                st.plotly_chart(style(fig), use_container_width=True)
+                st.caption("전체 전환율과 집단 비중이 동시에 변하더라도 인과관계가 확정되는 것은 아닙니다.")
+            with st.expander(f"🤖 AI 해설 · {focus}"):
+                focus_sum = subset[dims].sum()
+                st.write(f"{focus} 집단의 선택 기간 가입자 수는 {int(focus_sum['가입자']):,}명, 30일 첫 주문 전환율은 {fmt(pct(focus_sum['첫주문30일'],focus_sum['가입자']))}, 조회 → 장바구니 전환율은 {fmt(pct(focus_sum['장바구니'],focus_sum['식당조회']))}입니다.")
+                st.write("월별 변화와 채널/플랫폼의 구성 변화를 우선 확인할 필요가 있습니다. 현재 데이터만으로 광고, UI, 쿠폰 등의 원인을 단정할 수 없습니다.")
+                st.caption(AI_SOURCE)
+
+    # ------------------------------------------------------------
+    # 5. 액션 카드 · 문제 → 개선 제안 → 측정 지표
+    # ------------------------------------------------------------
+    with tab_action:
+        st.markdown("### 개선 우선순위 및 액션")
+        st.caption("6주차에서 관찰된 문제를 개선 가설로 연결하고, 측정 KPI를 확인합니다.")
+        recent = [mo for mo in months if start <= mo <= end][-3:]
+        f_recent = df[df["가입월"].isin(recent)]
+        r_recent = rd[rd["가입월"].isin(recent)]
+        focus_name = HIGHLIGHT if HIGHLIGHT in channels else (channels[0] if channels else None)
+        view_seg = f_recent[f_recent["가입채널"] == focus_name] if focus_name else f_recent.iloc[:0]
+        reorder_seg = r_recent[r_recent["가입채널"] == focus_name] if focus_name else r_recent.iloc[:0]
+
+        action_cards = [
+            {
+                "number": "01",
+                "title": "장바구니 전환 개선",
+                "priority": "우선순위 · 높음",
+                "category": "구매 전환 퍼널",
+                "issue": "식당을 조회한 뒤 장바구니에 담지 않고 이탈할 가능성",
+                "plan": "식당 상세·메뉴 탐색부터 장바구니 추가까지의 행동을 점검하고, 개선안의 A/B 테스트를 진행합니다.",
+                "metric": "조회 → 장바구니 전환율",
+                "value": fmt(pct(view_seg["장바구니"].sum(), view_seg["식당조회"].sum())),
+                "formula": "장바구니에 도달한 신규 가입자 ÷ 식당을 조회한 신규 가입자",
+                "reference": "개요 ② / 탐색 드릴다운",
+                "evidence": "6주차 세션 기준 전체 조회 → 장바구니 전환율은 2025-12 53.6%에서 2026-04 43.8%로 하락했습니다. 해당 추이와 지금의 가입자 기준 KPI는 서로 다른 지표입니다.",
+            },
+            {
+                "number": "02",
+                "title": "초기 재주문 개선",
+                "priority": "우선순위 · 중간",
+                "category": "고객 리텐션",
+                "issue": "첫 주문 이후 30일 안에 다시 주문하지 않는 고객 발생",
+                "plan": "첫 주문 후 재방문 구간을 분석하고, 재주문 유도 실험 후 집단별 KPI를 비교합니다.",
+                "metric": "첫 주문 후 30일 재주문율",
+                "value": fmt(pct(reorder_seg["재주문30일"].sum(), reorder_seg["첫주문고객"].sum())),
+                "formula": "첫 주문 후 30일 내 재주문한 고객 ÷ 첫 주문 고객",
+                "reference": "개요 ③ / 탐색 집단 비교",
+                "evidence": "6주차 분석에서 organic 유입 첫 주문 고객의 30일 재주문율은 76.8%에서 73.3%로 하락했습니다. 현 KPI는 신규 가입월·가입채널 기준 별도 집계입니다.",
+            },
+        ]
+
+        action_cols = st.columns(2, gap="medium")
+        for col, item in zip(action_cols, action_cards):
+            with col:
+                with st.container(border=True):
+                    st.caption(f"ACTION {item['number']}  ·  {item['category']}")
+                    st.subheader(item["title"])
+                    st.markdown(f"**{item['priority']}**")
+                    st.markdown("**문제 정의**")
+                    st.write(item["issue"])
+                    st.markdown("**개선 액션**")
+                    st.write(item["plan"])
+                    st.divider()
+                    st.caption(f"측정 KPI · {item['metric']}")
+                    st.metric("측정값", item["value"], label_visibility="collapsed")
+                    st.caption(f"최근 3개월 · {focus_name or '해당 집단 없음'} · {item['reference']}")
+                    with st.popover("ⓘ 근거 및 계산 기준"):
+                        st.markdown("**6주차 분석 근거**")
+                        st.write(item["evidence"])
+                        st.markdown("**현재 KPI 산식**")
+                        st.write(item["formula"])
+                        st.caption("기간은 사이드바에서 선택한 가입월의 마지막 3개월이며, 가입 채널·플랫폼 필터는 적용하지 않습니다.")
+        st.caption("※ 이 탭의 측정 KPI에는 기간 필터만 적용되며, 가입 채널·플랫폼 필터는 적용되지 않습니다.")
+        st.info("위 액션은 관찰 데이터에 기반한 개선 가설입니다. 추가 로그 분석과 A/B 테스트 전에는 원인이나 효과가 확정되지 않습니다.")
+
+with tab_upload:
+    st.subheader("📤 데이터 업로드")
+    st.caption("올린 CSV는 현재 세션에서만 분석에 사용되며 서버 폴더나 GitHub에 저장하지 않습니다.")
+    st.file_uploader("app_events.csv 올리기", type="csv", key="upload_file")
+    st.caption(f"현재 분석 데이터: {source_label}")
+    st.info("주문 기록은 기존 data/orders.csv를 계속 사용합니다. 이벤트 데이터와 주문 데이터의 고객·기간이 다를 수 있으므로 지표 해석에 주의하세요.")
