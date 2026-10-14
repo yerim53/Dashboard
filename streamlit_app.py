@@ -235,12 +235,27 @@ with tab_overview:
     st.caption("핵심 KPI → 월별 문제 추이 → 유입 집단 비교 → 재주문 순서로 확인합니다.")
     total = f[["가입자", "식당조회", "장바구니", "결제시작", "첫주문30일"]].sum()
     repeated = rf[["첫주문고객", "재주문30일"]].sum()
-    with st.container(border=True):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("가입 후 30일 첫 주문 전환율", fmt(pct(total["첫주문30일"], total["가입자"])))
-        c2.metric("식당 조회 → 장바구니 전환율", fmt(pct(total["장바구니"], total["식당조회"])))
-        c3.metric("첫 주문 후 30일 재주문율", fmt(pct(repeated["재주문30일"], repeated["첫주문고객"])))
-        st.caption("현재 KPI는 가입자 또는 첫 주문 고객의 30일 행동 기준입니다. 6주차 세션 기준 45.7%와 직접 비교할 수 없습니다.")
+    st.markdown("### 핵심 KPI")
+    kpi_cards = [
+        ("01", "첫 주문 전환율", "가입 후 30일", fmt(pct(total["첫주문30일"], total["가입자"])),
+         "첫 주문 고객 ÷ 가입자", "신규 가입자의 구매 전환"),
+        ("02", "장바구니 전환율", "식당 조회 → 장바구니", fmt(pct(total["장바구니"], total["식당조회"])),
+         "장바구니 이용자 ÷ 식당 조회자", "탐색에서 장바구니로 이어지는 비율"),
+        ("03", "30일 재주문율", "첫 주문 후 30일", fmt(pct(repeated["재주문30일"], repeated["첫주문고객"])),
+         "30일 내 재주문 고객 ÷ 첫 주문 고객", "첫 주문 이후의 고객 유지"),
+    ]
+    kpi_columns = st.columns(3, gap="medium")
+    for column, (number, title, period_label, value, formula, summary) in zip(kpi_columns, kpi_cards):
+        with column:
+            with st.container(border=True):
+                st.caption(f"KPI {number}  ·  {period_label}")
+                st.markdown(f"**{title}**")
+                st.metric(label="전환율", value=value, label_visibility="collapsed")
+                st.caption(summary)
+                with st.popover("ⓘ 계산 기준"):
+                    st.write(formula)
+                    st.caption("현재 사이드바에서 선택한 가입월·가입 채널·플랫폼 조건이 적용됩니다.")
+    st.caption("※ 위 KPI는 가입자 또는 첫 주문 고객의 30일 행동 기준이며, 6주차의 세션 기준 45.7%와 직접 비교하지 않습니다.")
 
     with st.container(border=True):
         st.markdown("**📏 지금 숫자 읽기**")
